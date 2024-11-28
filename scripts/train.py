@@ -82,6 +82,31 @@ if is_wandb_available():
     import wandb
 
 
+class AllGatherGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        tensor: Tensor,
+        group: Optional["torch.distributed.ProcessGroup"] = group.WORLD,
+    ) -> Tensor:
+        ctx.group = group
+
+        gathered_tensor = [torch.zeros_like(tensor) for _ in range(torch.distributed.get_world_size())]
+
+        torch.distributed.all_gather(gathered_tensor, tensor, group=group)
+        gathered_tensor = torch.stack(gathered_tensor, dim=0)
+
+        return gathered_tensor
+
+    @staticmethod
+    def backward(ctx: Any, *grad_output: Tensor) -> Tuple[Tensor, None]:
+        grad_output = torch.cat(grad_output)
+
+        torch.distributed.all_reduce(grad_output, op=torch.distributed.ReduceOp.SUM, async_op=False, group=ctx.group)
+
+        return grad_output[torch.distributed.get_rank()], None
+
+
 def get_random_downsample_ratio(sample_size, image_ratio=[],
                                 all_choices=False, rng=None):
     def _create_special_list(length):
@@ -1194,6 +1219,20 @@ def main():
             num_workers=args.dataloader_num_workers,
         )
 
+    # init up process group, refer to https://github.com/microsoft/Megatron-DeepSpeed/blob/main/megatron/core/parallel_state.py#L221
+    for i in range(num_sequence_data_parallel_groups):
+        ranks = range(i * sequence_data_parallel_size,
+                    (i + 1) * sequence_data_parallel_size)
+        group = torch.distributed.new_group(ranks)
+        all_data_sequence_parallel_group_ranks.append(list(ranks))
+        if rank in ranks:
+            _SEQUENCE_DATA_PARALLEL_GROUP = group
+
+    # replace train_dataloader batch_sampler to ensure process in up group read the same data
+    batch_sampler = torch distributed batch sampler/dataloader with `world_size = torch.distributed.get_world_size() / torch.distributed.get_world_size(group=_SEQUENCE_DATA_PARALLEL_GROUP)` \ 
+    and `rank = torch.distributed.get_world_size(group=DP_GROUP)`
+    train_dataloader.batch_sampler = batch_sampler
+
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1207,6 +1246,9 @@ def main():
         num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
+
+    # replace attention module in transformer3d to DistributedAttention. https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/sequence/layer.py#L271
+    # or implement custom Attention use _SeqAllToAll. https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/sequence/layer.py#L216
 
     # Prepare everything with our `accelerator`.
     transformer3d, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -1560,6 +1602,11 @@ def main():
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
+                # partition input among up group, assume noisy_latents shape is [b, s, h]
+                up_rank = torch.distributed.get_rank(group=_SEQUENCE_DATA_PARALLEL_GROUP)
+                partirioned_len_sequence = noisy_latents.shape[1] // torch.distributed.get_world_size(group=_SEQUENCE_DATA_PARALLEL_GROUP)
+                noisy_latents = noisy_latents[:, up_rank*partirioned_len_sequence:(up_rank+1)*partirioned_len_sequence, :]
+
                 # predict the noise residual
                 noise_pred = transformer3d(
                     hidden_states=noisy_latents,
@@ -1570,7 +1617,9 @@ def main():
                     inpaint_latents=inpaint_latents if args.train_mode != "normal" else None,
                 )[0]
                 print(noise_pred.size(), noisy_latents.size(), latents.size(), pixel_values.size())
-                loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+                # all reduce loss in up group, should take nccl allreduce back propagation into consideration
+                noise_pred_full = AllGatherGrad.apply(noise_pred, group=_SEQUENCE_DATA_PARALLEL_GROUP)
+                loss = F.mse_loss(noise_pred_full.float(), target.float(), reduction="mean")
 
                 if args.motion_sub_loss and noise_pred.size()[1] > 2:
                     gt_sub_noise = noise_pred[:, 1:, :].float() - noise_pred[:, :-1, :].float()
